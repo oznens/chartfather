@@ -1,0 +1,521 @@
+//@version=6
+strategy("ChartFather Bot", overlay=true, max_labels_count=500, max_boxes_count=500, max_lines_count=500, initial_capital=1000, default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+// === Timeframe kontrolü ===
+if timeframe.period != "5"
+    runtime.error("Bu strateji sadece 5 dakikalık grafiklerde çalışır!")
+
+// === Strateji Parametreleri ===
+stopLossPercent  = input.float(0.2, "Min Stop Loss %",        minval=0.1, step=0.1, group="Strateji")
+riskRewardRatio  = input.float(2.0, "Risk/Reward Oranı",      minval=1.0, step=0.1, group="Strateji")
+maxFvgFill       = input.float(90.0,"Maksimum FVG Doluluk %", minval=0.0, maxval=100.0, group="Strateji")
+entryType        = input.string("Frontsuz", "Giriş Tipi",     options=["Frontlu", "Frontsuz"], group="Strateji")
+htfPeriod        = input.timeframe("240", "HTF Zaman Dilimi (Kural 8)", group="Strateji")
+swingLen         = input.int(5, "Swing pivot uzunluğu",       minval=2,  group="Strateji")
+liqLookback      = input.int(30,"Likidite tarama uzunluğu",   minval=5,  group="Strateji")
+liqTolerance     = input.float(0.05, "Eşit dip/tepe toleransı %", minval=0.01, step=0.01, group="Strateji")
+
+// === Kural Toggle'ları ===
+useRule2 = input.bool(true, "Kural 2: OB öncesi likidite",           group="Kurallar")
+useRule3 = input.bool(true, "Kural 3: IRL expansion içinde",         group="Kurallar")
+useRule4 = input.bool(true, "Kural 4: Min. swing hareket",           group="Kurallar")
+useRule5 = input.bool(true, "Kural 5: Stop'ta eşit dip/tepe yok",    group="Kurallar")
+useRule6 = input.bool(true, "Kural 6: FVG doluluk kontrolü",         group="Kurallar")
+useRule7 = input.bool(true, "Kural 7: Stop mesafesi %0.2 üstü",      group="Kurallar")
+useRule8 = input.bool(true, "Kural 8: HTF FVG kontrolü",             group="Kurallar")
+
+// === Veri yapıları (paralel diziler) ===
+var box[]   supplyZones      = array.new_box(0)
+var box[]   demandZones      = array.new_box(0)
+var int[]   supplyTimestamps = array.new_int(0)
+var int[]   demandTimestamps = array.new_int(0)
+var label[] supplyLabels     = array.new_label(0)
+var label[] demandLabels     = array.new_label(0)
+var float[] supplyExpSize    = array.new_float(0)  // expansion mum boyu (high-low)
+var float[] demandExpSize    = array.new_float(0)
+var float[] supplyFvgTop     = array.new_float(0)  // OB candle low (bearish FVG üst)
+var float[] supplyFvgBot     = array.new_float(0)  // sonraki bar high  (bearish FVG alt)
+var float[] demandFvgTop     = array.new_float(0)  // sonraki bar low   (bullish FVG üst)
+var float[] demandFvgBot     = array.new_float(0)  // OB candle high    (bullish FVG alt)
+var bool[]  supplyLiqClosed  = array.new_bool(0)
+var bool[]  demandLiqClosed  = array.new_bool(0)
+
+// === Body oranı (expansion candle tespiti) ===
+bodyRate() =>
+    epsilon       = 0.00001
+    bodySize      = math.abs(open    - close)
+    prevBodySize  = math.abs(open[1] - close[1])
+    bodySize     := bodySize     == 0.0 ? epsilon : bodySize
+    prevBodySize := prevBodySize == 0.0 ? epsilon : prevBodySize
+    bodySize / prevBodySize >= 1.5
+
+// === OB Tespiti ===
+// Supply Zone: önceki bullish + şimdiki bearish + low kırıldı + body rate + bodyrate
+if (open > close) and (open[1] <= close[1]) and (low < low[1]) and bodyRate()
+    liqClosed = high >= high[1]
+    expSize   = high - low
+    labelTxt  = liqClosed ? "Liq Kapalı" : "Liq Açık"
+    labelBar  = liqClosed ? bar_index    : bar_index[1]
+    labelY    = liqClosed ? high         : high[1]
+    boxTop    = liqClosed ? high         : high[1]
+
+    LabelSupply = label.new(labelBar, labelY, labelTxt, style=label.style_label_down, color=color.red, textcolor=color.white)
+    BoxSupply   = box.new(bar_index[1], boxTop, bar_index + 15, low[1], border_color=color.rgb(248, 72, 36), bgcolor=color.new(color.white, 90))
+
+    array.push(supplyLabels,     LabelSupply)
+    array.push(supplyZones,      BoxSupply)
+    array.push(supplyTimestamps, bar_index)
+    array.push(supplyExpSize,    expSize)
+    array.push(supplyFvgTop,     na)
+    array.push(supplyFvgBot,     na)
+    array.push(supplyLiqClosed,  liqClosed)
+
+// Demand Zone: önceki bearish + şimdiki bullish + high kırıldı + body rate
+if (open < close) and (open[1] >= close[1]) and (high > high[1]) and bodyRate()
+    liqClosed = low <= low[1]
+    expSize   = high - low
+    labelTxt  = liqClosed ? "Liq Kapalı" : "Liq Açık"
+    labelBar  = bar_index[1]
+    labelY    = liqClosed ? low          : low[1]
+    boxBot    = liqClosed ? low          : low[1]
+
+    LabelDemand = label.new(labelBar, labelY, labelTxt, style=label.style_label_up, color=color.green, textcolor=color.white)
+    BoxDemand   = box.new(bar_index[1], high[1], bar_index + 15, boxBot, border_color=#0ff51a, bgcolor=color.new(color.white, 90))
+
+    array.push(demandLabels,     LabelDemand)
+    array.push(demandZones,      BoxDemand)
+    array.push(demandTimestamps, bar_index)
+    array.push(demandExpSize,    expSize)
+    array.push(demandFvgTop,     na)
+    array.push(demandFvgBot,     na)
+    array.push(demandLiqClosed,  liqClosed)
+
+// === FVG hesaplama (OB sonrası bir bar geçince) ===
+// Bearish FVG (supply): OB candle low (high[2]'nin OB'si yani low[2]) ile expansion sonrası bar high arasında boşluk
+// Pattern: bar -2 = OB candle, bar -1 = expansion, bar 0 = current
+if array.size(supplyZones) > 0
+    for i = 0 to array.size(supplyZones) - 1
+        ts = array.get(supplyTimestamps, i)
+        if bar_index == ts + 1 and na(array.get(supplyFvgTop, i))
+            obCandleLow = low[2]
+            nextHigh    = high
+            if obCandleLow > nextHigh
+                array.set(supplyFvgTop, i, obCandleLow)
+                array.set(supplyFvgBot, i, nextHigh)
+            else
+                array.set(supplyFvgTop, i, 0.0)
+                array.set(supplyFvgBot, i, 0.0)
+
+if array.size(demandZones) > 0
+    for i = 0 to array.size(demandZones) - 1
+        ts = array.get(demandTimestamps, i)
+        if bar_index == ts + 1 and na(array.get(demandFvgTop, i))
+            obCandleHigh = high[2]
+            nextLow      = low
+            if obCandleHigh < nextLow
+                array.set(demandFvgTop, i, nextLow)
+                array.set(demandFvgBot, i, obCandleHigh)
+            else
+                array.set(demandFvgTop, i, 0.0)
+                array.set(demandFvgBot, i, 0.0)
+
+// === Kural 1: Tested OB'leri sil ===
+orderblockTester() =>
+    var box[]   toDeleteSupply      = array.new_box(0)
+    var box[]   toDeleteDemand      = array.new_box(0)
+    var label[] toDeleteSupplyLabel = array.new_label(0)
+    var label[] toDeleteDemandLabel = array.new_label(0)
+
+    if array.size(supplyZones) > 0
+        for i = 0 to array.size(supplyZones) - 1
+            supplyZone      = array.get(supplyZones, i)
+            supplyTimestamp = array.get(supplyTimestamps, i)
+            supplyLabel     = array.get(supplyLabels, i)
+            if (close >= box.get_bottom(supplyZone) or high >= box.get_bottom(supplyZone)) and bar_index - supplyTimestamp >= 1
+                array.push(toDeleteSupply,      supplyZone)
+                array.push(toDeleteSupplyLabel, supplyLabel)
+
+    if array.size(demandZones) > 0
+        for i = 0 to array.size(demandZones) - 1
+            demandZone      = array.get(demandZones, i)
+            demandTimestamp = array.get(demandTimestamps, i)
+            demandLabel     = array.get(demandLabels, i)
+            if (close <= box.get_top(demandZone) or low <= box.get_top(demandZone)) and bar_index - demandTimestamp >= 1
+                array.push(toDeleteDemand,      demandZone)
+                array.push(toDeleteDemandLabel, demandLabel)
+
+    if array.size(toDeleteSupply) > 0
+        for i = 0 to array.size(toDeleteSupply) - 1
+            supplyZone = array.get(toDeleteSupply, i)
+            box.delete(supplyZone)
+            idx = array.indexof(supplyZones, supplyZone)
+            if idx >= 0
+                array.remove(supplyZones,      idx)
+                array.remove(supplyTimestamps, idx)
+                array.remove(supplyExpSize,    idx)
+                array.remove(supplyFvgTop,     idx)
+                array.remove(supplyFvgBot,     idx)
+                array.remove(supplyLiqClosed,  idx)
+                lbl = array.remove(supplyLabels, idx)
+                label.delete(lbl)
+
+    if array.size(toDeleteDemand) > 0
+        for i = 0 to array.size(toDeleteDemand) - 1
+            demandZone = array.get(toDeleteDemand, i)
+            box.delete(demandZone)
+            idx = array.indexof(demandZones, demandZone)
+            if idx >= 0
+                array.remove(demandZones,      idx)
+                array.remove(demandTimestamps, idx)
+                array.remove(demandExpSize,    idx)
+                array.remove(demandFvgTop,     idx)
+                array.remove(demandFvgBot,     idx)
+                array.remove(demandLiqClosed,  idx)
+                lbl = array.remove(demandLabels, idx)
+                label.delete(lbl)
+
+    // geçici listeleri temizle
+    array.clear(toDeleteSupply)
+    array.clear(toDeleteDemand)
+    array.clear(toDeleteSupplyLabel)
+    array.clear(toDeleteDemandLabel)
+
+orderblockTester()
+
+// === Swing pivot tespiti ===
+ph = ta.pivothigh(swingLen, swingLen)
+pl = ta.pivotlow (swingLen, swingLen)
+var float[] swingHighs    = array.new_float(0)
+var int[]   swingHighsBar = array.new_int(0)
+var float[] swingLows     = array.new_float(0)
+var int[]   swingLowsBar  = array.new_int(0)
+if not na(ph)
+    array.push(swingHighs,    ph)
+    array.push(swingHighsBar, bar_index - swingLen)
+    if array.size(swingHighs) > 200
+        array.shift(swingHighs)
+        array.shift(swingHighsBar)
+if not na(pl)
+    array.push(swingLows,    pl)
+    array.push(swingLowsBar, bar_index - swingLen)
+    if array.size(swingLows) > 200
+        array.shift(swingLows)
+        array.shift(swingLowsBar)
+
+// === HTF FVG verisi (Kural 8) ===
+// 3-bar pattern: bar[3] en eski, bar[1] en yeni tamamlanmış
+[htfH1, htfL1, htfH3, htfL3] = request.security(syminfo.tickerid, htfPeriod, [high[1], low[1], high[3], low[3]], lookahead=barmerge.lookahead_off)
+// Bearish HTF FVG: bar[3].low > bar[1].high → boşluk [htfH1, htfL3]
+// Bullish HTF FVG: bar[3].high < bar[1].low → boşluk [htfH3, htfL1]
+htfBearFvgExists = htfL3 > htfH1
+htfBullFvgExists = htfH3 < htfL1
+htfBearFvgTop    = htfL3
+htfBearFvgBot    = htfH1
+htfBullFvgTop    = htfL1
+htfBullFvgBot    = htfH3
+
+// === Yardımcı: bir fiyat HTF FVG aralığına denk geliyor mu? ===
+inHtfBearFvg(price) =>
+    htfBearFvgExists and price <= htfBearFvgTop and price >= htfBearFvgBot
+inHtfBullFvg(price) =>
+    htfBullFvgExists and price <= htfBullFvgTop and price >= htfBullFvgBot
+
+// === Kural 2: OB öncesi likidite var mı? ===
+// OB oluşum barından önceki liqLookback bar içinde, 2 expansion boyu mesafede en az 1 pivot likidite olmalı
+hasPreLiquiditySupply(obBar, obTop, expSize) =>
+    bool found = false
+    maxDist = expSize * 2
+    if array.size(swingHighs) > 0
+        for i = array.size(swingHighs) - 1 to 0 by -1
+            sb = array.get(swingHighsBar, i)
+            sh = array.get(swingHighs, i)
+            if sb < obBar and obBar - sb <= liqLookback
+                if sh >= obTop - maxDist and sh <= obTop + maxDist
+                    found := true
+                    break
+    found
+
+hasPreLiquidityDemand(obBar, obBot, expSize) =>
+    bool found = false
+    maxDist = expSize * 2
+    if array.size(swingLows) > 0
+        for i = array.size(swingLows) - 1 to 0 by -1
+            sb = array.get(swingLowsBar, i)
+            sl = array.get(swingLows, i)
+            if sb < obBar and obBar - sb <= liqLookback
+                if sl >= obBot - maxDist and sl <= obBot + maxDist
+                    found := true
+                    break
+    found
+
+// === Kural 3: IRL expansion içinde mi? ===
+// IRL = OB'ye en yakın internal liquidity (lokal high/low). OB box sınırları içinde olmalı.
+getIrlSupply(obBar, obTop, obBot) =>
+    float irl = na
+    if array.size(swingHighs) > 0
+        for i = array.size(swingHighs) - 1 to 0 by -1
+            sb = array.get(swingHighsBar, i)
+            sh = array.get(swingHighs, i)
+            if sb >= obBar and sh <= obTop and sh >= obBot
+                irl := sh
+                break
+    irl
+
+getIrlDemand(obBar, obTop, obBot) =>
+    float irl = na
+    if array.size(swingLows) > 0
+        for i = array.size(swingLows) - 1 to 0 by -1
+            sb = array.get(swingLowsBar, i)
+            sl = array.get(swingLows, i)
+            if sb >= obBar and sl <= obTop and sl >= obBot
+                irl := sl
+                break
+    irl
+
+// === Kural 4: OB sonrası swing hareket var mı? ===
+hasSwingAfter(obBar) =>
+    int highCount = 0
+    int lowCount  = 0
+    if array.size(swingHighs) > 0
+        for i = 0 to array.size(swingHighs) - 1
+            if array.get(swingHighsBar, i) > obBar
+                highCount += 1
+    if array.size(swingLows) > 0
+        for i = 0 to array.size(swingLows) - 1
+            if array.get(swingLowsBar, i) > obBar
+                lowCount += 1
+    highCount >= 1 and lowCount >= 1
+
+// === Kural 5: Stop seviyesinde eşit dip/tepe yok ===
+hasEqualHighsNear(stopPrice, obBar) =>
+    bool problem = false
+    tol = stopPrice * liqTolerance / 100.0
+    if array.size(swingHighs) > 0
+        for i = 0 to array.size(swingHighs) - 1
+            sb = array.get(swingHighsBar, i)
+            sh = array.get(swingHighs, i)
+            if sb < obBar and obBar - sb <= liqLookback
+                if math.abs(sh - stopPrice) <= tol
+                    problem := true
+                    break
+    problem
+
+hasEqualLowsNear(stopPrice, obBar) =>
+    bool problem = false
+    tol = stopPrice * liqTolerance / 100.0
+    if array.size(swingLows) > 0
+        for i = 0 to array.size(swingLows) - 1
+            sb = array.get(swingLowsBar, i)
+            sl = array.get(swingLows, i)
+            if sb < obBar and obBar - sb <= liqLookback
+                if math.abs(sl - stopPrice) <= tol
+                    problem := true
+                    break
+    problem
+
+// === Kural 6: FVG doluluk oranı ===
+// FVG aralığı: [fvgBot, fvgTop]. Doluluk: fvg oluştuktan sonra fiyatın FVG içine girme oranı
+fvgFillRatioSupply(fvgTop, fvgBot, obBar) =>
+    float fill = 0.0
+    if not na(fvgTop) and fvgTop > 0 and fvgBot > 0
+        gap = fvgTop - fvgBot
+        if gap > 0
+            // OB sonrası bardan bu yana en düşük high (FVG'nin altına dönüş) - bizim için ilgili: en yüksek (low) FVG'ye kadar inen
+            // Bearish FVG için doluluk = fiyat fvgBot'tan fvgTop'a doğru yükselirse = (max(low_after_ob) - fvgBot) / gap
+            // Aslında doğru olan: bar bar yukarıdan inen veya tabanından yukarı çıkan?
+            // Bearish FVG (supply): FVG OB altında, fiyat aşağıdan yukarı doğru FVG'yi doldurur (rally)
+            // Doluluk = (highestSinceFvg - fvgBot) / gap, clipped 0..1
+            float maxHigh = fvgBot
+            barsBack = bar_index - obBar
+            if barsBack > 0
+                for k = 0 to math.min(barsBack, 500)
+                    h = high[k]
+                    if h > maxHigh and h <= fvgTop
+                        maxHigh := h
+                    if h >= fvgTop
+                        maxHigh := fvgTop
+                        break
+            fill := (maxHigh - fvgBot) / gap * 100.0
+    fill
+
+fvgFillRatioDemand(fvgTop, fvgBot, obBar) =>
+    float fill = 0.0
+    if not na(fvgTop) and fvgTop > 0 and fvgBot > 0
+        gap = fvgTop - fvgBot
+        if gap > 0
+            // Bullish FVG (demand): FVG OB üstünde, fiyat yukarıdan aşağı doldurur
+            // Doluluk = (fvgTop - minLowSinceFvg) / gap
+            float minLow = fvgTop
+            barsBack = bar_index - obBar
+            if barsBack > 0
+                for k = 0 to math.min(barsBack, 500)
+                    l = low[k]
+                    if l < minLow and l >= fvgBot
+                        minLow := l
+                    if l <= fvgBot
+                        minLow := fvgBot
+                        break
+            fill := (fvgTop - minLow) / gap * 100.0
+    fill
+
+// === Kural 7: Stop mesafesi %0.2'den yüksek ===
+stopDistanceOk(entry, stop) =>
+    entry > 0 ? (math.abs(entry - stop) / entry * 100.0) >= stopLossPercent : false
+
+// === OB Doğrulama ===
+isValidOrderBlockSupply(idx) =>
+    obZone   = array.get(supplyZones,      idx)
+    obBar    = array.get(supplyTimestamps, idx)
+    expSize  = array.get(supplyExpSize,    idx)
+    fvgTop   = array.get(supplyFvgTop,     idx)
+    fvgBot   = array.get(supplyFvgBot,     idx)
+    obTop    = box.get_top(obZone)
+    obBot    = box.get_bottom(obZone)
+
+    bool ok = true
+    if useRule2 and not hasPreLiquiditySupply(obBar, obTop, expSize)
+        ok := false
+    if useRule4 and not hasSwingAfter(obBar)
+        ok := false
+    if useRule6 and not na(fvgTop) and fvgFillRatioSupply(fvgTop, fvgBot, obBar) >= maxFvgFill
+        ok := false
+    ok
+
+isValidOrderBlockDemand(idx) =>
+    obZone   = array.get(demandZones,      idx)
+    obBar    = array.get(demandTimestamps, idx)
+    expSize  = array.get(demandExpSize,    idx)
+    fvgTop   = array.get(demandFvgTop,     idx)
+    fvgBot   = array.get(demandFvgBot,     idx)
+    obTop    = box.get_top(obZone)
+    obBot    = box.get_bottom(obZone)
+
+    bool ok = true
+    if useRule2 and not hasPreLiquidityDemand(obBar, obBot, expSize)
+        ok := false
+    if useRule4 and not hasSwingAfter(obBar)
+        ok := false
+    if useRule6 and not na(fvgTop) and fvgFillRatioDemand(fvgTop, fvgBot, obBar) >= maxFvgFill
+        ok := false
+    ok
+
+// === Pozisyon yönetimi ===
+manageTrades() =>
+    if strategy.position_size == 0
+
+        // --- SHORT (supply) ---
+        if array.size(supplyZones) > 0
+            for i = array.size(supplyZones) - 1 to 0 by -1
+                supplyZone = array.get(supplyZones, i)
+                obBar      = array.get(supplyTimestamps, i)
+                obTop      = box.get_top(supplyZone)
+                obBot      = box.get_bottom(supplyZone)
+
+                if isValidOrderBlockSupply(i)
+                    // Frontlu: OB bottom seviyesine değerse giriş
+                    // Frontsuz: OB içindeki IRL'den giriş
+                    float entryPrice = na
+                    float stopPrice  = obTop
+                    bool  trigger    = false
+
+                    if entryType == "Frontlu"
+                        if high >= obBot
+                            entryPrice := obBot
+                            trigger    := true
+                    else
+                        irl = getIrlSupply(obBar, obTop, obBot)
+                        if not na(irl) and useRule3
+                            entryPrice := irl
+                            if high >= irl
+                                trigger := true
+                        else if not useRule3
+                            // IRL yoksa OB bottom kullan
+                            entryPrice := obBot
+                            if high >= obBot
+                                trigger := true
+
+                    if trigger and not na(entryPrice)
+                        // Kural 5: stop'ta eşit tepe yok
+                        rule5Ok = not useRule5 or not hasEqualHighsNear(stopPrice, obBar)
+                        // Kural 7: stop mesafesi
+                        rule7Ok = not useRule7 or stopDistanceOk(entryPrice, stopPrice)
+                        // Kural 8: HTF FVG stop seviyesine denk gelmemeli
+                        rule8Ok = not useRule8 or not inHtfBearFvg(stopPrice)
+
+                        if rule5Ok and rule7Ok and rule8Ok
+                            riskAmount  = math.abs(stopPrice - entryPrice)
+                            targetPrice = entryPrice - (riskAmount * riskRewardRatio)
+                            strategy.entry("Short", strategy.short, limit=entryPrice, comment="5M Short " + entryType)
+                            strategy.exit ("Short Exit", "Short", stop=stopPrice, limit=targetPrice)
+                            break
+
+        // --- LONG (demand) ---
+        if strategy.position_size == 0 and array.size(demandZones) > 0
+            for i = array.size(demandZones) - 1 to 0 by -1
+                demandZone = array.get(demandZones, i)
+                obBar      = array.get(demandTimestamps, i)
+                obTop      = box.get_top(demandZone)
+                obBot      = box.get_bottom(demandZone)
+
+                if isValidOrderBlockDemand(i)
+                    float entryPrice = na
+                    float stopPrice  = obBot
+                    bool  trigger    = false
+
+                    if entryType == "Frontlu"
+                        if low <= obTop
+                            entryPrice := obTop
+                            trigger    := true
+                    else
+                        irl = getIrlDemand(obBar, obTop, obBot)
+                        if not na(irl) and useRule3
+                            entryPrice := irl
+                            if low <= irl
+                                trigger := true
+                        else if not useRule3
+                            entryPrice := obTop
+                            if low <= obTop
+                                trigger := true
+
+                    if trigger and not na(entryPrice)
+                        rule5Ok = not useRule5 or not hasEqualLowsNear(stopPrice, obBar)
+                        rule7Ok = not useRule7 or stopDistanceOk(entryPrice, stopPrice)
+                        rule8Ok = not useRule8 or not inHtfBullFvg(stopPrice)
+
+                        if rule5Ok and rule7Ok and rule8Ok
+                            riskAmount  = math.abs(entryPrice - stopPrice)
+                            targetPrice = entryPrice + (riskAmount * riskRewardRatio)
+                            strategy.entry("Long", strategy.long, limit=entryPrice, comment="5M Long " + entryType)
+                            strategy.exit ("Long Exit", "Long", stop=stopPrice, limit=targetPrice)
+                            break
+
+manageTrades()
+
+// === Frontlu giriş için 2R IRL iptal kontrolü ===
+// Pozisyon açıldıktan sonra eğer fiyat ters yönde 2R'a giderse iptal et
+if strategy.position_size != 0 and entryType == "Frontlu"
+    avgPrice = strategy.position_avg_price
+    if strategy.position_size > 0
+        // Long: stop = position_stop; eğer fiyat 2R aşağı giderse cancel (zaten stop devreye girer ama IRL kontrolü için)
+        // Burada sadece bekleyen limit emirleri için iptal mantığı eklenir
+        if array.size(demandZones) > 0
+            lastDemand = array.get(demandZones, array.size(demandZones) - 1)
+            obBar      = array.get(demandTimestamps, array.size(demandTimestamps) - 1)
+            obBot      = box.get_bottom(lastDemand)
+            irl        = getIrlDemand(obBar, box.get_top(lastDemand), obBot)
+            if not na(irl)
+                risk2R = math.abs(avgPrice - obBot) * 2
+                if low <= irl - risk2R
+                    strategy.cancel("Long")
+    if strategy.position_size < 0
+        if array.size(supplyZones) > 0
+            lastSupply = array.get(supplyZones, array.size(supplyZones) - 1)
+            obBar      = array.get(supplyTimestamps, array.size(supplyTimestamps) - 1)
+            obTop      = box.get_top(lastSupply)
+            irl        = getIrlSupply(obBar, obTop, box.get_bottom(lastSupply))
+            if not na(irl)
+                risk2R = math.abs(obTop - avgPrice) * 2
+                if high >= irl + risk2R
+                    strategy.cancel("Short")
+
+/////////////////////////////////////////////////////////////////////////////////////
