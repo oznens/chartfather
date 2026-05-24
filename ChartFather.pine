@@ -225,8 +225,10 @@ inHtfBullFvg(price) =>
 hasPreLiquiditySupply(obBar, obTop, expSize) =>
     bool found = false
     maxDist = expSize * 2
-    if array.size(swingHighs) > 0
-        for i = array.size(swingHighs) - 1 to 0 by -1
+    sz = array.size(swingHighs)
+    if sz > 0
+        for j = 0 to sz - 1
+            i = sz - 1 - j
             sb = array.get(swingHighsBar, i)
             sh = array.get(swingHighs, i)
             if sb < obBar and obBar - sb <= liqLookback
@@ -238,8 +240,10 @@ hasPreLiquiditySupply(obBar, obTop, expSize) =>
 hasPreLiquidityDemand(obBar, obBot, expSize) =>
     bool found = false
     maxDist = expSize * 2
-    if array.size(swingLows) > 0
-        for i = array.size(swingLows) - 1 to 0 by -1
+    sz = array.size(swingLows)
+    if sz > 0
+        for j = 0 to sz - 1
+            i = sz - 1 - j
             sb = array.get(swingLowsBar, i)
             sl = array.get(swingLows, i)
             if sb < obBar and obBar - sb <= liqLookback
@@ -252,8 +256,10 @@ hasPreLiquidityDemand(obBar, obBot, expSize) =>
 // IRL = OB'ye en yakın internal liquidity (lokal high/low). OB box sınırları içinde olmalı.
 getIrlSupply(obBar, obTop, obBot) =>
     float irl = na
-    if array.size(swingHighs) > 0
-        for i = array.size(swingHighs) - 1 to 0 by -1
+    sz = array.size(swingHighs)
+    if sz > 0
+        for j = 0 to sz - 1
+            i = sz - 1 - j
             sb = array.get(swingHighsBar, i)
             sh = array.get(swingHighs, i)
             if sb >= obBar and sh <= obTop and sh >= obBot
@@ -263,8 +269,10 @@ getIrlSupply(obBar, obTop, obBot) =>
 
 getIrlDemand(obBar, obTop, obBot) =>
     float irl = na
-    if array.size(swingLows) > 0
-        for i = array.size(swingLows) - 1 to 0 by -1
+    sz = array.size(swingLows)
+    if sz > 0
+        for j = 0 to sz - 1
+            i = sz - 1 - j
             sb = array.get(swingLowsBar, i)
             sl = array.get(swingLows, i)
             if sb >= obBar and sl <= obTop and sl >= obBot
@@ -404,8 +412,10 @@ manageTrades() =>
     if strategy.position_size == 0
 
         // --- SHORT (supply) ---
-        if array.size(supplyZones) > 0
-            for i = array.size(supplyZones) - 1 to 0 by -1
+        szS = array.size(supplyZones)
+        if szS > 0
+            for j = 0 to szS - 1
+                i = szS - 1 - j
                 supplyZone = array.get(supplyZones, i)
                 obBar      = array.get(supplyTimestamps, i)
                 obTop      = box.get_top(supplyZone)
@@ -450,8 +460,10 @@ manageTrades() =>
                             break
 
         // --- LONG (demand) ---
-        if strategy.position_size == 0 and array.size(demandZones) > 0
-            for i = array.size(demandZones) - 1 to 0 by -1
+        szD = array.size(demandZones)
+        if strategy.position_size == 0 and szD > 0
+            for j = 0 to szD - 1
+                i = szD - 1 - j
                 demandZone = array.get(demandZones, i)
                 obBar      = array.get(demandTimestamps, i)
                 obTop      = box.get_top(demandZone)
