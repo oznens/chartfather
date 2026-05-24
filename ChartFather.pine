@@ -131,7 +131,8 @@ orderblockTester() =>
             supplyZone      = array.get(supplyZones, i)
             supplyTimestamp = array.get(supplyTimestamps, i)
             supplyLabel     = array.get(supplyLabels, i)
-            if (close >= box.get_bottom(supplyZone) or high >= box.get_bottom(supplyZone)) and bar_index - supplyTimestamp >= 1
+            // OB invalid = fiyat OB top'unun ÜZERİNDE kapanırsa (tamamen kırıldıysa)
+            if close > box.get_top(supplyZone) and bar_index - supplyTimestamp >= 1
                 array.push(toDeleteSupply,      supplyZone)
                 array.push(toDeleteSupplyLabel, supplyLabel)
 
@@ -140,7 +141,8 @@ orderblockTester() =>
             demandZone      = array.get(demandZones, i)
             demandTimestamp = array.get(demandTimestamps, i)
             demandLabel     = array.get(demandLabels, i)
-            if (close <= box.get_top(demandZone) or low <= box.get_top(demandZone)) and bar_index - demandTimestamp >= 1
+            // OB invalid = fiyat OB bottom'unun ALTINDA kapanırsa
+            if close < box.get_bottom(demandZone) and bar_index - demandTimestamp >= 1
                 array.push(toDeleteDemand,      demandZone)
                 array.push(toDeleteDemandLabel, demandLabel)
 
@@ -180,7 +182,8 @@ orderblockTester() =>
     array.clear(toDeleteSupplyLabel)
     array.clear(toDeleteDemandLabel)
 
-orderblockTester()
+// NOT: orderblockTester() aşağıda, manageTrades()'in SONRASINDA çağrılır.
+// Sıra önemli: önce işlem yerleştirilmeli, sonra geçersiz OB'ler silinmeli.
 
 // === Swing pivot tespiti ===
 ph = ta.pivothigh(swingLen, swingLen)
@@ -281,18 +284,18 @@ getIrlDemand(obBar, obTop, obBot) =>
     irl
 
 // === Kural 4: OB sonrası swing hareket var mı? ===
+// En az 1 swing pivot (high veya low) oluşmuş olmalı
 hasSwingAfter(obBar) =>
-    int highCount = 0
-    int lowCount  = 0
+    int total = 0
     if array.size(swingHighs) > 0
         for i = 0 to array.size(swingHighs) - 1
             if array.get(swingHighsBar, i) > obBar
-                highCount += 1
+                total += 1
     if array.size(swingLows) > 0
         for i = 0 to array.size(swingLows) - 1
             if array.get(swingLowsBar, i) > obBar
-                lowCount += 1
-    highCount >= 1 and lowCount >= 1
+                total += 1
+    total >= 1
 
 // === Kural 5: Stop seviyesinde eşit dip/tepe yok ===
 hasEqualHighsNear(stopPrice, obBar) =>
@@ -408,100 +411,89 @@ isValidOrderBlockDemand(idx) =>
     ok
 
 // === Pozisyon yönetimi ===
+// Her bar, geçerli OB'ler arasından fiyata en yakın olanı seç ve aktif limit emir tut
 manageTrades() =>
     if strategy.position_size == 0
-
-        // --- SHORT (supply) ---
+        // --- SHORT (supply): fiyata en yakın geçerli supply OB ---
+        float bestSupplyEntry  = na
+        float bestSupplyStop   = na
         szS = array.size(supplyZones)
         if szS > 0
             for j = 0 to szS - 1
                 i = szS - 1 - j
-                supplyZone = array.get(supplyZones, i)
-                obBar      = array.get(supplyTimestamps, i)
-                obTop      = box.get_top(supplyZone)
-                obBot      = box.get_bottom(supplyZone)
-
                 if isValidOrderBlockSupply(i)
-                    // Frontlu: OB bottom seviyesine değerse giriş
-                    // Frontsuz: OB içindeki IRL'den giriş
-                    float entryPrice = na
-                    float stopPrice  = obTop
-                    bool  trigger    = false
+                    supplyZone = array.get(supplyZones, i)
+                    obBar      = array.get(supplyTimestamps, i)
+                    obTop      = box.get_top(supplyZone)
+                    obBot      = box.get_bottom(supplyZone)
 
-                    if entryType == "Frontlu"
-                        if high >= obBot
-                            entryPrice := obBot
-                            trigger    := true
-                    else
+                    float entryPrice = obBot
+                    if entryType == "Frontsuz"
                         irl = getIrlSupply(obBar, obTop, obBot)
                         if not na(irl) and useRule3
                             entryPrice := irl
-                            if high >= irl
-                                trigger := true
-                        else if not useRule3
-                            // IRL yoksa OB bottom kullan
-                            entryPrice := obBot
-                            if high >= obBot
-                                trigger := true
 
-                    if trigger and not na(entryPrice)
-                        // Kural 5: stop'ta eşit tepe yok
-                        rule5Ok = not useRule5 or not hasEqualHighsNear(stopPrice, obBar)
-                        // Kural 7: stop mesafesi
-                        rule7Ok = not useRule7 or stopDistanceOk(entryPrice, stopPrice)
-                        // Kural 8: HTF FVG stop seviyesine denk gelmemeli
-                        rule8Ok = not useRule8 or not inHtfBearFvg(stopPrice)
+                    float stopPrice = obTop
 
-                        if rule5Ok and rule7Ok and rule8Ok
-                            riskAmount  = math.abs(stopPrice - entryPrice)
-                            targetPrice = entryPrice - (riskAmount * riskRewardRatio)
-                            strategy.entry("Short", strategy.short, limit=entryPrice, comment="5M Short " + entryType)
-                            strategy.exit ("Short Exit", "Short", stop=stopPrice, limit=targetPrice)
-                            break
+                    rule5Ok = not useRule5 or not hasEqualHighsNear(stopPrice, obBar)
+                    rule7Ok = not useRule7 or stopDistanceOk(entryPrice, stopPrice)
+                    rule8Ok = not useRule8 or not inHtfBearFvg(stopPrice)
 
-        // --- LONG (demand) ---
+                    if rule5Ok and rule7Ok and rule8Ok and entryPrice > close
+                        if na(bestSupplyEntry) or entryPrice < bestSupplyEntry
+                            bestSupplyEntry := entryPrice
+                            bestSupplyStop  := stopPrice
+
+        if not na(bestSupplyEntry)
+            risk   = bestSupplyStop - bestSupplyEntry
+            target = bestSupplyEntry - risk * riskRewardRatio
+            strategy.entry("Short", strategy.short, limit=bestSupplyEntry, comment="5M Short " + entryType)
+            strategy.exit ("Short Exit", "Short", stop=bestSupplyStop, limit=target)
+        else
+            strategy.cancel("Short")
+
+        // --- LONG (demand): fiyata en yakın geçerli demand OB ---
+        float bestDemandEntry = na
+        float bestDemandStop  = na
         szD = array.size(demandZones)
-        if strategy.position_size == 0 and szD > 0
+        if szD > 0
             for j = 0 to szD - 1
                 i = szD - 1 - j
-                demandZone = array.get(demandZones, i)
-                obBar      = array.get(demandTimestamps, i)
-                obTop      = box.get_top(demandZone)
-                obBot      = box.get_bottom(demandZone)
-
                 if isValidOrderBlockDemand(i)
-                    float entryPrice = na
-                    float stopPrice  = obBot
-                    bool  trigger    = false
+                    demandZone = array.get(demandZones, i)
+                    obBar      = array.get(demandTimestamps, i)
+                    obTop      = box.get_top(demandZone)
+                    obBot      = box.get_bottom(demandZone)
 
-                    if entryType == "Frontlu"
-                        if low <= obTop
-                            entryPrice := obTop
-                            trigger    := true
-                    else
+                    float entryPrice = obTop
+                    if entryType == "Frontsuz"
                         irl = getIrlDemand(obBar, obTop, obBot)
                         if not na(irl) and useRule3
                             entryPrice := irl
-                            if low <= irl
-                                trigger := true
-                        else if not useRule3
-                            entryPrice := obTop
-                            if low <= obTop
-                                trigger := true
 
-                    if trigger and not na(entryPrice)
-                        rule5Ok = not useRule5 or not hasEqualLowsNear(stopPrice, obBar)
-                        rule7Ok = not useRule7 or stopDistanceOk(entryPrice, stopPrice)
-                        rule8Ok = not useRule8 or not inHtfBullFvg(stopPrice)
+                    float stopPrice = obBot
 
-                        if rule5Ok and rule7Ok and rule8Ok
-                            riskAmount  = math.abs(entryPrice - stopPrice)
-                            targetPrice = entryPrice + (riskAmount * riskRewardRatio)
-                            strategy.entry("Long", strategy.long, limit=entryPrice, comment="5M Long " + entryType)
-                            strategy.exit ("Long Exit", "Long", stop=stopPrice, limit=targetPrice)
-                            break
+                    rule5Ok = not useRule5 or not hasEqualLowsNear(stopPrice, obBar)
+                    rule7Ok = not useRule7 or stopDistanceOk(entryPrice, stopPrice)
+                    rule8Ok = not useRule8 or not inHtfBullFvg(stopPrice)
+
+                    if rule5Ok and rule7Ok and rule8Ok and entryPrice < close
+                        if na(bestDemandEntry) or entryPrice > bestDemandEntry
+                            bestDemandEntry := entryPrice
+                            bestDemandStop  := stopPrice
+
+        if not na(bestDemandEntry)
+            risk   = bestDemandEntry - bestDemandStop
+            target = bestDemandEntry + risk * riskRewardRatio
+            strategy.entry("Long", strategy.long, limit=bestDemandEntry, comment="5M Long " + entryType)
+            strategy.exit ("Long Exit", "Long", stop=bestDemandStop, limit=target)
+        else
+            strategy.cancel("Long")
 
 manageTrades()
+
+// === Tested OB temizleme (manageTrades'den SONRA) ===
+orderblockTester()
 
 // === Frontlu giriş için 2R IRL iptal kontrolü ===
 // Pozisyon açıldıktan sonra eğer fiyat ters yönde 2R'a giderse iptal et
